@@ -1,0 +1,82 @@
+# Copy into the project repo as .github/workflows/relay-issue-intake.yml.
+#
+# Labeling an issue `agent:build` sends it to the relay orchestrator as a
+# build request: {"project": RELAY_PROJECT, "action": "build", "task": ...}.
+# The dev-team agent then opens a PR titled after the issue.
+#
+# `make github-intake REPO=<owner/name> PROJECT=<key>` sets up everything this
+# needs: secret RELAY_TOKEN, variables RELAY_URL / RELAY_ORCHESTRATOR_ID /
+# RELAY_PROJECT, and the label. The job runs on the in-cluster ARC runner
+# because the relay is not reachable from GitHub-hosted runners.
+#
+# Only issues opened AND labeled by zssvaidar are processed; anyone else's
+# issue is skipped here and rejected again by the orchestrator worker.
+# Opening an issue alone does nothing. The issue text is untrusted input and
+# is only ever passed through env vars, never interpolated into the script.
+name: Relay issue intake
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  issues: write   # comment the relay task id back on the issue
+
+jobs:
+  submit:
+    if: >-
+      github.event.label.name == 'agent:build' &&
+      github.event.issue.user.login == 'zssvaidar' &&
+      github.event.sender.login == 'zssvaidar'
+    runs-on: ${{ vars.RELAY_RUNNER || 'agent-relay-runner' }}
+    timeout-minutes: 5
+    steps:
+      - name: Send issue to the orchestrator
+        env:
+          RELAY_URL: ${{ vars.RELAY_URL }}
+          RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
+          ORCHESTRATOR: ${{ vars.RELAY_ORCHESTRATOR_ID }}
+          PROJECT: ${{ vars.RELAY_PROJECT }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          LABELED_BY: ${{ github.event.sender.login }}
+          RUN_ID: ${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Belt and braces in case the job-level `if` is ever edited.
+          if [ "$ISSUE_AUTHOR" != zssvaidar ] || [ "$LABELED_BY" != zssvaidar ]; then
+            echo "::error::issue by '$ISSUE_AUTHOR' (labeled by '$LABELED_BY') is not allowed"; exit 1
+          fi
+          for v in RELAY_URL RELAY_TOKEN ORCHESTRATOR PROJECT; do
+            [ -n "${!v}" ] || { echo "::error::$v is not configured (run make github-intake)"; exit 1; }
+          done
+          # actions-runner ships jq; install it only if a custom image lacks it.
+          command -v jq >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
+
+          # First line of the task becomes the PR title.
+          task="$(printf '%s\n\n%s\n\nRequested in %s' "$ISSUE_TITLE" "$ISSUE_BODY" "$ISSUE_URL")"
+          body="$(jq -n --arg to "$ORCHESTRATOR" --arg project "$PROJECT" --arg task "$task" \
+            --arg author "$ISSUE_AUTHOR" \
+            '{to: $to, input: ({project: $project, action: "build", task: $task, issue_author: $author} | tojson)}')"
+
+          # Same run (re-run of a failed job) -> same task; a new label event -> new task.
+          resp="$(curl -sS --fail-with-body -X POST "$RELAY_URL/api/v1/tasks" \
+            -H "Authorization: Bearer $RELAY_TOKEN" \
+            -H 'content-type: application/json' \
+            -H "Idempotency-Key: gh-issue:$REPO#$ISSUE_NUMBER:$RUN_ID" \
+            -d "$body")"
+          task_id="$(jq -r .task_id <<<"$resp")"
+          echo "queued orchestrator task $task_id"
+          echo "### Relay task \`$task_id\`" >> "$GITHUB_STEP_SUMMARY"
+
+          comment="$(jq -n --arg id "$task_id" \
+            '{body: ("Sent to the agent relay orchestrator as task `" + $id + "`. The dev-team agent will open a PR when it is done.")}')"
+          curl -sS --fail-with-body -X POST \
+            "https://api.github.com/repos/$REPO/issues/$ISSUE_NUMBER/comments" \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            -d "$comment" >/dev/null

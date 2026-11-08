@@ -1,7 +1,8 @@
 """dev-team / reviewer / sandbox / model proxy / free-text orchestrator tests.
 
-Uses a local bare git remote, the real sandbox app in-process with a fake agent
-(``agent_runner.query``) and a fake LLM, so nothing reaches GitHub or the model API.
+Uses a local bare git remote, the real sandbox app in-process with a fake
+``claude -p`` (``claude_cli.run_claude``) and a fake router runner, so nothing
+reaches GitHub or the model. The claude_cli tests run a stub ``claude`` script.
 """
 
 from __future__ import annotations
@@ -9,20 +10,21 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import subprocess
-import types
+import sys
 from pathlib import Path
 
-import anthropic
 import httpx
 import pytest
-from anthropic.types import ToolUseBlock
-from claude_agent_sdk import CLIConnectionError, ResultMessage
 
+import agent_guard
 import agent_roles
 import agent_runner
+import claude_cli
 import model_proxy
-from common import TransientError
+from claude_cli import ClaudeResult
+from common import AgentError, TransientError
 from handlers import make_orchestrator
 from projects import parse_registry
 from repo_ops import GitError, clone_url, github_slug
@@ -43,10 +45,14 @@ def sh(*args: str, cwd: Path | str | None = None) -> str:
     return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
 
 
-def result(**fields) -> ResultMessage:
-    base = {"subtype": "success", "duration_ms": 1, "duration_api_ms": 1, "is_error": False,
-            "num_turns": 1, "session_id": "s"}
-    return ResultMessage(**(base | fields))
+def result(**fields) -> ClaudeResult:
+    base = {"subtype": "success", "is_error": False, "result": ""}
+    return ClaudeResult(**(base | fields))
+
+
+def flag(args: list[str], name: str) -> str:
+    """Value following ``name`` in a claude argv."""
+    return args[args.index(name) + 1]
 
 
 @pytest.fixture(autouse=True)
@@ -98,20 +104,19 @@ def tree_contains(root: Path, needle: str) -> bool:
 
 @pytest.fixture()
 def agent(monkeypatch):
-    """Replace the agent with ``behavior(cwd) -> ResultMessage`` (or an exception)."""
+    """Replace ``claude -p`` with ``behavior(cwd) -> ClaudeResult`` (or an exception)."""
     seen: dict = {}
 
     def use(behavior):
-        async def fake_query(*, prompt, options):
-            seen.update(prompt=prompt, options=options)
-            cwd = Path(options.cwd)
-            assert not tree_contains(cwd, TOKEN), "token reachable by the agent"
+        async def fake_run(prompt, args, *, cwd, timeout, env=None):
+            seen.update(prompt=prompt, args=list(args), cwd=cwd, env=env)
+            assert not tree_contains(Path(cwd), TOKEN), "token reachable by the agent"
             assert sh("git", "remote", cwd=cwd) == "", "sandbox clone has a remote"
             if isinstance(behavior, Exception):
                 raise behavior
-            yield behavior(options.cwd)
+            return behavior(cwd)
 
-        monkeypatch.setattr(agent_runner, "query", fake_query)
+        monkeypatch.setattr(claude_cli, "run_claude", fake_run)
         return seen
 
     return use
@@ -127,7 +132,7 @@ def call(handler, request, task_id: str = "t-1"):
     return asyncio.run(run())
 
 
-def commit_feature(cwd: str) -> ResultMessage:
+def commit_feature(cwd: str) -> ClaudeResult:
     Path(cwd, "feature.py").write_text("print('hi')\n")
     sh("git", "add", ".", cwd=cwd)
     sh("git", "commit", "-qm", "add feature", cwd=cwd)
@@ -150,9 +155,11 @@ def test_dev_pushes_branch_and_reports_it(dev, agent, remote):
     assert output["branch"] == "agent/t-1" and output["pr"] is None  # not GitHub
     assert sh("git", "rev-parse", "agent/t-1", cwd=remote) == output["sha"]
     assert TOKEN not in out
-    options = seen["options"]
-    assert "Use pytest." in options.system_prompt
-    assert options.permission_mode == "dontAsk" and options.setting_sources == []
+    args = seen["args"]
+    assert "Use pytest." in flag(args, "--system-prompt")
+    assert flag(args, "--permission-mode") == "dontAsk" and flag(args, "--setting-sources") == ""
+    assert "agent_guard.py" in flag(args, "--settings")
+    assert seen["env"] == {agent_guard.ROOT_ENV: seen["cwd"]}
     assert seen["prompt"] == "Task:\nAdd a feature"
 
 
@@ -232,12 +239,9 @@ def test_dev_agent_failures(dev, agent, behavior, prefix):
     assert status == "fail" and error.startswith(prefix)
 
 
-@pytest.mark.parametrize(
-    "behavior",
-    [lambda cwd: result(is_error=True, api_error_status=529), CLIConnectionError("down")],
-)
-def test_dev_transient_agent_failures_are_redelivered(dev, agent, behavior):
-    agent(behavior)
+def test_dev_transient_agent_failures_are_redelivered(dev, agent):
+    # run_claude raises TransientError for a missing CLI or a 429/5xx (test_claude_cli_errors).
+    agent(TransientError("model API returned 529"))
     with pytest.raises(TransientError):
         call(dev, BUILD)
 
@@ -270,9 +274,10 @@ def test_review_reports_verdict_with_read_only_tools(reviewer, agent):
     assert status == "complete"
     output = json.loads(out)
     assert output["verdict"] == "request_changes" and output["posted"] is False
-    options = seen["options"]
-    assert not {"Edit", "Write"} & set(options.allowed_tools)
-    assert options.output_format == agent_roles.VERDICT_SCHEMA
+    args = seen["args"]
+    assert not {"Edit", "Write"} & set(flag(args, "--allowedTools").split(","))
+    assert flag(args, "--tools") == flag(args, "--allowedTools")
+    assert json.loads(flag(args, "--json-schema")) == agent_roles.VERDICT_SCHEMA["schema"]
     assert reviewed["head"] == output["sha"]  # the sandbox checked out the PR head
 
 
@@ -317,10 +322,84 @@ def test_review_failures(reviewer, agent, request_, prefix):
     ],
 )
 def test_guard(tmp_path, tool, args, denied):
-    hook = agent_runner.guard(tmp_path)[0].hooks[0]
-    out = asyncio.run(hook({"tool_name": tool, "tool_input": args}, None, None))
+    out = agent_guard.decide({"tool_name": tool, "tool_input": args}, tmp_path)
     decision = out.get("hookSpecificOutput", {}).get("permissionDecision")
     assert (decision == "deny") is denied
+
+
+def run_guard(stdin: str, root: str | None) -> dict:
+    env = {k: v for k, v in os.environ.items() if k != agent_guard.ROOT_ENV}
+    if root:
+        env[agent_guard.ROOT_ENV] = root
+    out = subprocess.run([sys.executable, agent_guard.__file__], input=stdin, env=env,
+                         capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+def test_guard_script_allows_inside_and_fails_closed(tmp_path):
+    call_ = json.dumps({"tool_name": "Read", "tool_input": {"file_path": "a.py"}})
+    assert run_guard(call_, str(tmp_path)) == {}
+    for stdin, root in ((call_, None), ("not json", str(tmp_path))):
+        assert run_guard(stdin, root)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# ---------------------------------------------------------------- claude_cli
+
+
+@pytest.fixture()
+def fake_claude(tmp_path, monkeypatch):
+    """Point claude_cli at a stub script that runs ``body`` (Python) and records its argv."""
+
+    def use(body: str) -> Path:
+        script = tmp_path / "claude"
+        script.write_text(f"#!{sys.executable}\nimport json, sys, time\n"
+                          f"open({str(tmp_path / 'argv')!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+                          f"prompt = sys.stdin.read()\n{body}\n")
+        script.chmod(0o755)
+        monkeypatch.setattr(claude_cli, "CLAUDE_BIN", str(script))
+        return tmp_path / "argv"
+
+    return use
+
+
+def run_cli(tmp_path, timeout=30):
+    return asyncio.run(claude_cli.run_claude("hello", ["--model", "m"], cwd=str(tmp_path), timeout=timeout))
+
+
+def test_claude_cli_parses_result(fake_claude, tmp_path):
+    argv = fake_claude('print("noise"); print(json.dumps({"type": "result", "subtype": "success", '
+                       '"is_error": False, "result": prompt, "structured_output": {"a": 1}}))')
+    out = run_cli(tmp_path)
+    assert out.result == "hello" and out.structured_output == {"a": 1} and not out.is_error
+    assert json.loads(argv.read_text())[:3] == ["-p", "--output-format", "json"]
+
+
+def test_claude_cli_failed_run_still_returns_result(fake_claude, tmp_path):
+    fake_claude('print(json.dumps({"type": "result", "subtype": "error_max_turns", '
+                '"is_error": True})); sys.exit(1)')
+    out = run_cli(tmp_path)
+    assert out.is_error and out.subtype == "error_max_turns"
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        ('print(json.dumps({"type": "result", "is_error": True, "api_error_status": 529}))',
+         TransientError),
+        ('sys.stderr.write("boom"); sys.exit(2)', AgentError),
+        ("time.sleep(10)", AgentError),
+    ],
+)
+def test_claude_cli_errors(fake_claude, tmp_path, body, error):
+    fake_claude(body)
+    with pytest.raises(error):
+        run_cli(tmp_path, timeout=1)
+
+
+def test_claude_cli_missing_binary_is_transient(monkeypatch, tmp_path):
+    monkeypatch.setattr(claude_cli, "CLAUDE_BIN", str(tmp_path / "nope"))
+    with pytest.raises(TransientError):
+        run_cli(tmp_path)
 
 
 # ---------------------------------------------------------------- repo_ops
@@ -350,7 +429,7 @@ def test_model_proxy_swaps_in_key_and_streams():
         seen.update(url=str(req.url), headers=req.headers, body=req.content)
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=b"data: hi\n\n")
 
-    proxy = model_proxy.create_app("real-key", httpx.MockTransport(upstream))
+    proxy = model_proxy.create_app("real-key", httpx.MockTransport(upstream), oauth_token="")
 
     async def go():
         transport = httpx.ASGITransport(app=proxy)
@@ -372,26 +451,42 @@ def test_model_proxy_swaps_in_key_and_streams():
     assert other.status_code == 404
 
 
+def test_model_proxy_prefers_subscription_token():
+    seen = {}
+
+    def upstream(req: httpx.Request) -> httpx.Response:
+        seen.update(headers=req.headers)
+        return httpx.Response(200, content=b"{}")
+
+    proxy = model_proxy.create_app("real-key", httpx.MockTransport(upstream), oauth_token="oat-1")
+
+    async def go():
+        transport = httpx.ASGITransport(app=proxy)
+        async with httpx.AsyncClient(transport=transport, base_url="http://p") as client:
+            await client.post("/v1/messages", headers={"x-api-key": "placeholder",
+                                                       "anthropic-beta": "a-1"}, content=b"{}")
+
+    asyncio.run(go())
+    headers = seen["headers"]
+    assert headers["authorization"] == "Bearer oat-1" and "x-api-key" not in headers
+    assert headers["anthropic-beta"] == f"a-1,{model_proxy.OAUTH_BETA}"
+
+
 # ---------------------------------------------------------------- free-text orchestrator
 
 
 class FakeLLM:
-    """Stands in for ``AsyncAnthropic``: returns one route_task call or raises."""
+    """Stands in for the router's ``claude -p`` runner: returns structured output or raises."""
 
-    def __init__(self, out=None, exc=None):
-        self.out, self.exc, self.messages = out, exc, self
+    def __init__(self, out=None, exc=None, **fields):
+        self.out, self.exc, self.fields = out, exc, fields
 
-    async def create(self, **kwargs):
-        assert kwargs["tool_choice"]["name"] == "route_task"
+    async def __call__(self, prompt, args):
+        assert flag(args, "--tools") == "" and "--json-schema" in args
+        assert prompt.startswith("<request>")
         if self.exc:
             raise self.exc
-        block = ToolUseBlock(type="tool_use", id="t", name="route_task", input=self.out)
-        return types.SimpleNamespace(content=[block])
-
-
-def api_error(status: int) -> anthropic.APIStatusError:
-    response = httpx.Response(status, request=httpx.Request("POST", "http://x"))
-    return anthropic.APIStatusError("e", response=response, body=None)
+        return result(structured_output=self.out, **self.fields)
 
 
 @pytest.fixture()
@@ -428,6 +523,16 @@ def test_orchestrator_build_needs_task(orchestrate):
     assert status == "fail" and error.startswith("invalid_input")
 
 
+@pytest.mark.parametrize(("author", "ok"), [("zssvaidar", True), ("someone-else", False), ("", False)])
+def test_orchestrator_only_accepts_issues_from_owner(orchestrate, author, ok):
+    request = {"project": "shop-api", "action": "build", "task": "Add login", "issue_author": author}
+    (status, error), child = orchestrate(json.dumps(request))
+    if ok:
+        assert status == "complete" and child["task"] == "Add login"
+    else:
+        assert status == "fail" and error.startswith("forbidden_author") and not child
+
+
 def test_orchestrator_routes_free_text(orchestrate):
     llm = FakeLLM({"project": "shop-api", "action": "build", "task": "Add login"})
     (status, out), child = orchestrate("add login to shop-api", llm)
@@ -446,7 +551,8 @@ def test_orchestrator_json_skips_llm(orchestrate):
     [
         (FakeLLM({"clarify": "Which project?"}), "needs_clarification"),
         (FakeLLM({"action": "deploy"}), "needs_clarification"),
-        (FakeLLM(exc=api_error(400)), "router_error"),
+        (FakeLLM(is_error=True, subtype="error_during_execution"), "router_error"),
+        (FakeLLM(exc=AgentError("timed out after 120s")), "router_error"),
     ],
 )
 def test_orchestrator_free_text_failures(orchestrate, llm, prefix):
@@ -456,4 +562,4 @@ def test_orchestrator_free_text_failures(orchestrate, llm, prefix):
 
 def test_orchestrator_overloaded_llm_is_transient(orchestrate):
     with pytest.raises(TransientError):
-        orchestrate("ship it", FakeLLM(exc=api_error(529)))
+        orchestrate("ship it", FakeLLM(exc=TransientError("model API returned 529")))

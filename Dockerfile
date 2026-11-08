@@ -13,8 +13,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # git: dev-team/reviewer clone and push project repos.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
+    && apt-get install -y --no-install-recommends git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Claude Code CLI: every AI task runs as `claude -p` (claude_cli.py).
+# Pinned, with auto-update off, so a build is reproducible.
+ARG CLAUDE_CODE_VERSION=2.1.316
+ENV DISABLE_AUTOUPDATER=1
+RUN curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_CODE_VERSION" \
+    && cp -L /root/.local/bin/claude /usr/local/bin/claude \
+    && rm -rf /root/.local /root/.claude /root/.claude.json \
+    && claude --version
 
 WORKDIR /app
 

@@ -104,8 +104,9 @@ To add a project: add an entry under `projects:`, run `make project-secret`, the
 
 ## Agent roles (dev-team, reviewer)
 
-`dev-team` and `reviewer` run a Claude agent (`claude-agent-sdk`) on the
-project's repo. The orchestrator dispatches to them:
+Every AI task runs Claude Code in headless mode, `claude -p` ([claude_cli.py](claude_cli.py)).
+`dev-team` and `reviewer` run it as an agent on the project's repo. The
+orchestrator dispatches to them:
 
 ```json
 {"project": "cp-expiry-tracker", "action": "build", "task": "Add a /health endpoint"}
@@ -113,10 +114,24 @@ project's repo. The orchestrator dispatches to them:
 ```
 
 The orchestrator also takes plain-text requests ("review PR 12 on
-cp-expiry-tracker"). When `ANTHROPIC_API_KEY` is set, it uses a model to map
-the text onto the same JSON, choosing only registered projects and known
-actions. If the project or action is unclear, the task fails with
+cp-expiry-tracker"). When a Claude credential is set, it runs a tool-less
+`claude -p --json-schema` call to map the text onto the same JSON, choosing
+only registered projects and known actions. If the project or action is unclear, the task fails with
 `needs_clarification`.
+
+### Claude credential
+
+The relay authenticates `claude -p` with a Claude subscription token, so AI
+tasks count against your subscription's usage limits instead of API credits:
+
+```bash
+claude setup-token > secrets/anthropic-key.txt   # secrets/ is gitignored
+make llm-secret FROM=secrets/anthropic-key.txt    # stores CLAUDE_CODE_OAUTH_TOKEN
+make redeploy
+```
+
+To use an API key instead: `make llm-secret FROM=<key file> KEY=ANTHROPIC_API_KEY`.
+The image pins the CLI version (`CLAUDE_CODE_VERSION` in the Dockerfile).
 
 ### Pod layout: the agent holds no credentials
 
@@ -124,7 +139,7 @@ actions. If the project or action is unclear, the task fails with
 |---------------|-------------------------------------------|------------------------------------------------|
 | `worker`      | relay token, project registry + git token | claims tasks, clones, pushes, GitHub API       |
 | `agent`       | nothing                                   | runs the agent ([agent_runner.py](agent_runner.py)) |
-| `model-proxy` | `ANTHROPIC_API_KEY`                       | forwards `/v1/*` to the API and adds the key ([model_proxy.py](model_proxy.py)) |
+| `model-proxy` | `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` | forwards `/v1/*` to the API and adds the credential ([model_proxy.py](model_proxy.py)) |
 
 Containers in a pod don't share a process namespace or Secret mounts, so the
 agent can't read the other containers' environment or files. Worker pods also
@@ -174,6 +189,32 @@ make llm-secret FROM=./anthropic-key.txt   # Secret relay-anthropic (ANTHROPIC_A
 make smoke-project PROJECT=cp-expiry-tracker ACTION=build TASK="Add a /health endpoint" TIMEOUT=1800
 make smoke-project PROJECT=cp-expiry-tracker ACTION=review PR=12 TIMEOUT=1800
 ```
+
+## GitHub issues -> orchestrator
+
+Labeling an issue `agent:build` in a project repo sends it to the orchestrator
+as `{"project": ..., "action": "build", "task": "<title>\n\n<body>"}`. The
+dev-team agent then opens a PR titled after the issue. Opening an issue alone
+does nothing; only people with triage access can add labels.
+
+```bash
+make github-intake REPO=zssvaidar/cp-expiry-tracker PROJECT=cp-expiry-tracker
+```
+
+This registers a `github-intake` sender (Secret `relay-github-intake`). It then
+sets the repo's `RELAY_TOKEN` secret and `RELAY_URL` / `RELAY_ORCHESTRATOR_ID` /
+`RELAY_PROJECT` variables, and creates the label. Then:
+
+1. Commit [integrations/github/relay-issue-intake.yml](integrations/github/relay-issue-intake.yml)
+   to the repo as `.github/workflows/relay-issue-intake.yml`.
+2. Register an ARC runner set for that repo. The relay is only reachable
+   in-cluster, and runner sets are per repo:
+   `GITHUB_TOKEN=<pat> make arc-runners GITHUB_CONFIG_URL=https://github.com/<owner/name>`.
+   If you use another `ARC_RUNNER_SET` name, pass `RUNNER=<name>` to `make github-intake`.
+
+The workflow comments the relay task id on the issue. Re-running a failed job
+reuses the same task (idempotency key `gh-issue:<repo>#<n>:<run_id>`).
+Re-applying the label creates a new task.
 
 ## Storage and delivery behavior
 

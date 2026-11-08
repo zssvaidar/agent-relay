@@ -16,8 +16,9 @@ import os
 import re
 from typing import Any
 
-import anthropic
 import httpx
+
+import claude_cli
 
 from agent_roles import make_dev_team, make_reviewer
 from common import (
@@ -37,12 +38,23 @@ from common import (
     require_task,
 )
 from projects import ProjectConfig, load_registry
-from router import interpret
+from router import Runner, interpret, run_router
 
 HANDLERS = ("uppercase", "orchestrator", "deployer", "dev-team", "reviewer")
 
 # Which worker role carries out each orchestrator action.
 ACTION_ROLES = {"build": "dev-team", "review": "reviewer", "deploy": "deployer"}
+
+# The only GitHub user whose issues the workers act on. Hardcoded on purpose.
+ALLOWED_ISSUE_AUTHOR = "zssvaidar"
+
+
+def require_allowed_author(request: dict[str, Any]) -> None:
+    """Reject GitHub-issue tasks (``issue_author`` set) not opened by the allowed user."""
+    if "issue_author" in request and request["issue_author"] != ALLOWED_ISSUE_AUTHOR:
+        raise RejectedError(
+            f"forbidden_author: only issues from {ALLOWED_ISSUE_AUTHOR} are processed"
+        )
 
 
 def role_env_var(role: str) -> str:
@@ -90,12 +102,12 @@ async def dispatch(client: httpx.AsyncClient, recipient: str, child_input: str, 
 def make_orchestrator(
     projects: dict[str, ProjectConfig],
     role_agents: dict[str, str],
-    llm: anthropic.AsyncAnthropic | None = None,
+    llm: Runner | None = None,
 ) -> Handler:
     """Build the handler that validates a request and dispatches it to a role.
 
-    With ``llm``, non-JSON input is interpreted as a free-text request;
-    without it, only JSON input is accepted.
+    With ``llm`` (a ``claude -p`` runner), non-JSON input is interpreted as a
+    free-text request; without it, only JSON input is accepted.
     """
 
     async def read_request(raw: str) -> tuple[dict[str, Any], bool]:
@@ -107,6 +119,7 @@ def make_orchestrator(
     @rejecting
     async def orchestrate(claim: dict[str, Any], client: httpx.AsyncClient) -> Outcome:
         request, interpreted = await read_request(claim["input"])
+        require_allowed_author(request)
         key = request["project"]
         project = lookup_project(projects, key)
         action = request.get("action", "deploy")
@@ -182,11 +195,12 @@ def make_deployer(projects: dict[str, ProjectConfig], secrets_dir: str | None = 
 # ---------------------------------------------------------------- selection
 
 
-def router_llm() -> anthropic.AsyncAnthropic | None:
-    """LLM client for free-text routing, or None when no API key is configured."""
-    if not os.getenv("ANTHROPIC_API_KEY"):
+def router_llm() -> Runner | None:
+    """``claude -p`` runner for free-text routing, or None without a CLI and credential."""
+    has_credential = os.getenv("CLAUDE_CODE_OAUTH_TOKEN") or os.getenv("ANTHROPIC_API_KEY")
+    if not (has_credential and claude_cli.available()):
         return None
-    return anthropic.AsyncAnthropic()
+    return run_router
 
 
 def build_handler(name: str) -> Handler:

@@ -9,6 +9,9 @@ HELM_ARGS ?=
 
 KUBECTL   := kubectl --context kind-$(CLUSTER) -n $(NS)
 HELM      := helm --kube-context kind-$(CLUSTER) -n $(NS)
+# Secrets can be stored before the first deploy; helm accepts an existing namespace.
+ENSURE_NS := kubectl --context kind-$(CLUSTER) create namespace $(NS) --dry-run=client -o yaml | \
+             kubectl --context kind-$(CLUSTER) apply -f - >/dev/null
 HELM_UP   := $(HELM) upgrade --install $(RELEASE) $(CHART) --create-namespace --wait --timeout 3m $(HELM_ARGS)
 
 # Optional filter for logs-workers, e.g. ROLE=reviewer
@@ -30,7 +33,7 @@ export NS BASE_URL
 .DEFAULT_GOAL := help
 .PHONY: help up cluster image deploy bootstrap template lint smoke status \
         logs logs-web logs-workers restart redeploy scale-workers uninstall \
-        check-projects project-secret llm-secret smoke-project \
+        check-projects project-secret llm-secret smoke-project github-intake \
         test down clean arc arc-runners arc-status arc-uninstall
 
 help: ## Show available targets
@@ -71,6 +74,10 @@ smoke-project: ## Ask the orchestrator to deploy PROJECT and follow the chain (R
 	@test -n "$(PROJECT)" || { echo "usage: make smoke-project PROJECT=<key> [REF=main] [ACTION=deploy]"; exit 1; }
 	PROJECT=$(PROJECT) REF=$(REF) TASK="$(TASK)" PR=$(PR) ACTION=$(or $(ACTION),deploy) ./scripts/smoke-project.sh
 
+github-intake: ## Send REPO's `agent:build` issues to the orchestrator: make github-intake REPO=<owner/name> PROJECT=<key>
+	@test -n "$(REPO)" -a -n "$(PROJECT)" || { echo "usage: make github-intake REPO=<owner/name> PROJECT=<key> [RUNNER=<runner set>]"; exit 1; }
+	REPO=$(REPO) PROJECT=$(PROJECT) RUNNER=$(RUNNER) ./scripts/github-intake.sh
+
 # The registry is the `projects:` block of values.yaml; projects.py validates it.
 check-projects: ## Validate the project registry and check each credentials Secret exists
 	@uv run python projects.py $(CHART)/values.yaml
@@ -81,14 +88,20 @@ check-projects: ## Validate the project registry and check each credentials Secr
 
 project-secret: ## Store a project's bot token: make project-secret PROJECT=<key> FROM=<token file>
 	@test -n "$(PROJECT)" -a -f "$(FROM)" || { echo "usage: make project-secret PROJECT=<key> FROM=<file containing the token>"; exit 1; }
+	@test -n "$$(tr -d '[:space:]' < "$(FROM)")" || { echo "$(FROM) is empty"; exit 1; }
+	@$(ENSURE_NS)
 	@name=$$(uv run python projects.py $(CHART)/values.yaml $(PROJECT)) && \
 	$(KUBECTL) create secret generic $$name --from-file=token=$(FROM) --dry-run=client -o yaml | $(KUBECTL) apply -f - && \
 	$(KUBECTL) label secret $$name app=agent-relay-project project=$(PROJECT) --overwrite >/dev/null && \
 	echo "stored secret/$$name (key: token)"
 
-llm-secret: ## Store the Anthropic API key for agent roles: make llm-secret FROM=<key file>
-	@test -f "$(FROM)" || { echo "usage: make llm-secret FROM=<file containing the API key>"; exit 1; }
-	@$(KUBECTL) create secret generic relay-anthropic --from-file=ANTHROPIC_API_KEY=$(FROM) \
+llm-secret: ## Store the Claude credential: make llm-secret FROM=<file> [KEY=CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY]
+	@test -f "$(FROM)" || { echo "usage: make llm-secret FROM=<file with a \`claude setup-token\` token> [KEY=ANTHROPIC_API_KEY for an API key]"; exit 1; }
+	@test -n "$$(tr -d '[:space:]' < "$(FROM)")" || { echo "$(FROM) is empty"; exit 1; }
+	@$(ENSURE_NS)
+	@# Strip the trailing newline editors add; it would break the auth header.
+	@tr -d '[:space:]' < "$(FROM)" | \
+	  $(KUBECTL) create secret generic relay-anthropic --from-file=$(or $(KEY),CLAUDE_CODE_OAUTH_TOKEN)=/dev/stdin \
 	  --dry-run=client -o yaml | $(KUBECTL) apply -f - && echo "stored secret/relay-anthropic"
 
 status: ## Show helm release, pods (with nodes), services and PVC

@@ -1,47 +1,40 @@
-"""Agent sandbox: runs the Claude agent on a git bundle, holding no credentials.
+"""Agent sandbox: runs Claude Code headlessly on a git bundle, holding no credentials.
 
 Runs as its own container in the dev-team / reviewer pods and listens on a
 unix socket (see sandbox.py for the protocol)::
 
     python agent_runner.py        # socket at $RELAY_AGENT_RUNNER_SOCKET
 
+Each run is one ``claude -p`` process (claude_cli.py) in the task's clone.
 Everything in this container is treated as reachable by the agent: it has no
 relay, git or model credential (``ANTHROPIC_BASE_URL`` points at the pod's
 model proxy), and its process namespace is separate from the worker's.
 
 Defence in depth inside the sandbox: an explicit tool list
-(``permission_mode="dontAsk"`` denies the rest), a PreToolUse hook keeping file
-tools in the workspace, and no settings or hooks loaded from the repository; its
-AGENTS.md / CLAUDE.md is read as plain text into the system prompt instead.
+(``--permission-mode dontAsk`` denies the rest), a PreToolUse command hook
+(agent_guard.py) keeping file tools in the workspace, and no settings or hooks
+loaded from the repository (``--setting-sources ""``); its AGENTS.md /
+CLAUDE.md is read as plain text into the system prompt instead.
 """
 
 from __future__ import annotations
 
-import asyncio
 import base64
+import json
 import os
-import re
+import shlex
 import shutil
+import sys
 import tempfile
 from pathlib import Path
-from typing import Any, cast
 
 import uvicorn
-from claude_agent_sdk import (
-    ClaudeAgentOptions,
-    ClaudeSDKError,
-    CLIConnectionError,
-    HookContext,
-    HookInput,
-    HookJSONOutput,
-    HookMatcher,
-    ResultMessage,
-    query,
-)
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
-from common import TRANSIENT, AgentError, RejectedError, TransientError
+import claude_cli
+from agent_guard import ROOT_ENV
+from common import AgentError, RejectedError, TransientError
 from repo_ops import BOT_EMAIL, BOT_NAME, git
 from sandbox import (
     DEFAULT_SOCKET,
@@ -53,17 +46,13 @@ from sandbox import (
     RunSpec,
 )
 
-AGENT_MODEL = os.getenv("AGENT_MODEL") or None  # None = SDK default
+AGENT_MODEL = os.getenv("AGENT_MODEL") or None  # None = CLI default
 AGENT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT_S", "1800"))
 AGENT_MAX_TURNS = int(os.getenv("AGENT_MAX_TURNS", "60"))
 AGENT_MAX_BUDGET_USD = float(os.getenv("AGENT_MAX_BUDGET_USD", "5"))
 WORK_ROOT = os.getenv("AGENT_WORK_ROOT", tempfile.gettempdir())
 MAX_INSTRUCTIONS = 20000
-MODEL_TRANSIENT = TRANSIENT | {529}
-
-FILE_TOOLS = frozenset({"Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "NotebookEdit"})
-# A nudge, not a boundary: the sandbox has no remote and no credential to push with.
-BLOCKED_BASH = re.compile(r"\bgit\b[^\n;&|]*\b(?:push|remote\s+set-url)\b")
+GUARD_SCRIPT = Path(__file__).with_name("agent_guard.py")
 
 app = FastAPI(title="Agent sandbox")
 
@@ -83,35 +72,10 @@ async def transient(_request: Request, exc: TransientError) -> JSONResponse:
 # ---------------------------------------------------------------- the agent run
 
 
-def deny(reason: str) -> HookJSONOutput:
-    """PreToolUse hook output that refuses the tool call."""
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    }
-
-
-def guard(workdir: Path) -> list[HookMatcher]:
-    """PreToolUse hook keeping file tools in ``workdir`` and blocking git push."""
-    root = workdir.resolve()
-
-    async def pre_tool_use(
-        input_data: HookInput, _tool_use_id: str | None, _ctx: HookContext
-    ) -> HookJSONOutput:
-        data = cast("dict[str, Any]", input_data)
-        name, args = data.get("tool_name"), data.get("tool_input") or {}
-        if name in FILE_TOOLS:
-            raw = args.get("file_path") or args.get("notebook_path") or args.get("path")
-            if raw and not (root / raw).resolve().is_relative_to(root):
-                return deny("file access outside the task workspace is not allowed")
-        elif name == "Bash" and BLOCKED_BASH.search(args.get("command", "")):
-            return deny("pushing is done by the worker after you finish; just commit")
-        return {}
-
-    return [HookMatcher(matcher=None, hooks=[pre_tool_use])]
+def guard_settings() -> str:
+    """``--settings`` JSON registering agent_guard.py as the PreToolUse hook."""
+    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(GUARD_SCRIPT))}"
+    return json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": command}]}]}})
 
 
 def repo_instructions(workdir: Path) -> str:
@@ -125,46 +89,38 @@ def repo_instructions(workdir: Path) -> str:
     return "\n\n".join(parts)
 
 
-def agent_options(spec: RunSpec, workdir: Path) -> ClaudeAgentOptions:
-    """Locked-down options for one headless agent run."""
-    return ClaudeAgentOptions(
-        cwd=str(workdir),
-        system_prompt=f"{spec.system}\n\n{repo_instructions(workdir)}".rstrip(),
-        allowed_tools=spec.tools,
-        permission_mode="dontAsk",  # anything not in allowed_tools is denied
-        disallowed_tools=["WebFetch", "WebSearch"],
-        setting_sources=[],  # don't load settings/hooks from the repo
-        hooks={"PreToolUse": guard(workdir)},
-        max_turns=AGENT_MAX_TURNS,
-        max_budget_usd=AGENT_MAX_BUDGET_USD,
-        model=AGENT_MODEL,
-        output_format=spec.output_format,
+def agent_args(spec: RunSpec, workdir: Path) -> list[str]:
+    """Locked-down ``claude -p`` flags for one agent run."""
+    tools = ",".join(spec.tools)
+    args = [
+        "--system-prompt", f"{spec.system}\n\n{repo_instructions(workdir)}".rstrip(),
+        "--tools", tools,  # the only built-in tools that exist in this run
+        "--allowedTools", tools,
+        "--disallowedTools", "WebFetch,WebSearch",
+        "--permission-mode", "dontAsk",  # anything not allowed is denied
+        "--setting-sources", "",  # don't load settings/hooks from the repo or $HOME
+        "--strict-mcp-config",  # and no MCP servers
+        "--settings", guard_settings(),
+        "--max-turns", str(AGENT_MAX_TURNS),
+        "--max-budget-usd", str(AGENT_MAX_BUDGET_USD),
+    ]
+    if AGENT_MODEL:
+        args += ["--model", AGENT_MODEL]
+    if spec.output_format:
+        args += ["--json-schema", json.dumps(spec.output_format["schema"])]
+    return args
+
+
+async def run_agent(spec: RunSpec, workdir: Path) -> claude_cli.ClaudeResult:
+    """Run Claude Code headlessly in ``workdir`` and return its result."""
+    root = str(workdir.resolve())
+    return await claude_cli.run_claude(
+        spec.prompt,
+        agent_args(spec, workdir),
+        cwd=root,
+        timeout=AGENT_TIMEOUT,
+        env={ROOT_ENV: root},
     )
-
-
-async def run_agent(options: ClaudeAgentOptions, prompt: str) -> ResultMessage:
-    """Run the agent to completion and return its final result message."""
-
-    async def collect() -> ResultMessage | None:
-        result = None
-        async for msg in query(prompt=prompt, options=options):
-            if isinstance(msg, ResultMessage):
-                result = msg
-        return result
-
-    try:
-        result = await asyncio.wait_for(collect(), timeout=AGENT_TIMEOUT)
-    except TimeoutError as exc:
-        raise AgentError(f"timed out after {AGENT_TIMEOUT}s") from exc
-    except CLIConnectionError as exc:
-        raise TransientError(f"agent CLI unavailable: {exc}") from exc
-    except ClaudeSDKError as exc:
-        raise AgentError(str(exc)) from exc
-    if result is None:
-        raise AgentError("ended without a result")
-    if result.is_error and result.api_error_status in MODEL_TRANSIENT:
-        raise TransientError(f"model API returned {result.api_error_status}")
-    return result
 
 
 # ---------------------------------------------------------------- the repository
@@ -235,7 +191,7 @@ async def run(run_id: str, spec: RunSpec) -> RunResult:
     try:
         repo = directory / "repo"
         await checkout(bundle, repo, spec)
-        result = await run_agent(agent_options(spec, repo), spec.prompt)
+        result = await run_agent(spec, repo)
         out = RunResult(
             is_error=result.is_error,
             subtype=result.subtype,

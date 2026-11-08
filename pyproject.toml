@@ -5,8 +5,6 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "anthropic>=2.6.0",
-    "claude-agent-sdk>=0.2.179",
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "psycopg[binary]>=3.3.5",
@@ -18,5 +16,6 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "anthropic>=2.6.0",  # only for test.py (API key check); the relay uses `claude -p`
     "pytest>=9.1.1",
 ]

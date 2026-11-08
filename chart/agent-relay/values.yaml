@@ -31,7 +31,7 @@ workers:
     handler: uppercase     # uppercase | orchestrator | deployer | dev-team | reviewer
     mountProjects: false   # mount ConfigMap relay-projects + set RELAY_PROJECTS_FILE
     mountProjectSecrets: false # mount every project's credentials Secret (read-only)
-    useLLM: false          # load ANTHROPIC_API_KEY into the worker (orchestrator routing)
+    useLLM: false          # load the Claude credential into the worker (orchestrator routing)
     sandbox: false         # add the agent sandbox + model proxy containers (see below)
     resources:
       requests: { cpu: 20m, memory: 64Mi }
@@ -66,10 +66,14 @@ workers:
     orchestrator:
       handler: orchestrator
       mountProjects: true
-      useLLM: true           # free-text requests; JSON-only without the key
+      useLLM: true           # free-text requests via `claude -p`; JSON-only without a credential
+      resources:             # room for the claude CLI process
+        requests: { cpu: 50m, memory: 128Mi }
+        limits: { memory: 512Mi }
 
-# Secret holding ANTHROPIC_API_KEY (make llm-secret), for roles with useLLM
-# and for the model proxy of sandbox roles.
+# Secret holding the Claude credential (make llm-secret), for roles with useLLM
+# and for the model proxy of sandbox roles: CLAUDE_CODE_OAUTH_TOKEN (a Claude
+# subscription token from `claude setup-token`) or ANTHROPIC_API_KEY.
 llm:
   secretName: relay-anthropic
 
@@ -81,7 +85,7 @@ sandbox:
     AGENT_MAX_TURNS: 60
     AGENT_MAX_BUDGET_USD: 5
     AGENT_TIMEOUT_S: 1800
-    # AGENT_MODEL: claude-opus-5-5   # unset = SDK default
+    # AGENT_MODEL: claude-opus-5-5   # unset = Claude Code's default model
   agentResources:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { memory: 2Gi }
@@ -96,7 +100,7 @@ sandbox:
 projects:
   cp-expiry-tracker:
     repo: git@github.com:zssvaidar/cp-expiry-tracker.git
-    default_branch: main
+    default_branch: master
     registry: ghcr.io/zssvaidar/cp-expiry-tracker
     deploy_target: k8s/cp-expiry-tracker
     credentials: secret/cp-expiry-tracker-bot

@@ -112,8 +112,9 @@ spec:
             - secretRef:
                 name: worker-{{ $role }}
             {{- if $cfg.useLLM }}
-            # ANTHROPIC_API_KEY; optional so the pod starts without it (the
-            # orchestrator then accepts JSON only).
+            # CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY for `claude -p`;
+            # optional so the pod starts without it (the orchestrator then
+            # accepts JSON only).
             - secretRef:
                 name: {{ $.Values.llm.secretName }}
                 optional: true
@@ -140,7 +141,7 @@ spec:
           resources:
             {{- toYaml $cfg.resources | nindent 12 }}
         {{- if $cfg.sandbox }}
-        # Untrusted: runs the Claude agent. No Secrets, no service-account
+        # Untrusted: runs the Claude agent (`claude -p`). No Secrets, no service-account
         # token, separate process namespace; reaches the worker only through
         # the socket and the model only through the proxy (sandbox.py).
         - name: agent
@@ -157,7 +158,10 @@ spec:
               value: /work/home
             - name: ANTHROPIC_BASE_URL
               value: http://127.0.0.1:{{ $.Values.sandbox.proxyPort }}
-            - name: ANTHROPIC_API_KEY
+            # Placeholder: the proxy drops it and adds the real credential.
+            # (A placeholder ANTHROPIC_API_KEY is rejected by a fresh CLI
+            # home as "Not logged in"; a bearer placeholder is not.)
+            - name: ANTHROPIC_AUTH_TOKEN
               value: added-by-model-proxy
             - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
               value: "1"
@@ -172,7 +176,7 @@ spec:
               mountPath: /work
           resources:
             {{- toYaml $.Values.sandbox.agentResources | nindent 12 }}
-        # Holds only the model API key; listens on the pod's loopback.
+        # Holds only the model credential; listens on the pod's loopback.
         - name: model-proxy
           image: {{ include "relay.image" $ }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}

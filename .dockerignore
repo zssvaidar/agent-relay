@@ -10,3 +10,4 @@ __pycache__
 k8s
 scripts
 Makefile
+secrets
