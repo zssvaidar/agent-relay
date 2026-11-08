@@ -1,0 +1,16 @@
+{{- /* Project registry for the orchestrator/deployer. Holds only references
+       to credential Secrets; reject anything that looks like a raw value. */ -}}
+{{- range $key, $p := .Values.projects }}
+{{- if not (hasPrefix "secret/" ($p.credentials | default "")) }}
+{{- fail (printf "projects.%s.credentials must be secret/<name>, not a raw value" $key) }}
+{{- end }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: relay-projects
+  labels:
+    {{- include "relay.labels" . | nindent 4 }}
+data:
+  projects.yaml: |
+    {{- toYaml (dict "projects" (.Values.projects | default dict)) | nindent 4 }}

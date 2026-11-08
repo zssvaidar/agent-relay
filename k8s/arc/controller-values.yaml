@@ -1,0 +1,10 @@
+# ARC (Actions Runner Controller) — gha-runner-scale-set-controller.
+# Exactly one controller pod; no HA / leader-election replicas.
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi

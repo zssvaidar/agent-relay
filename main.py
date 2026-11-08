@@ -318,6 +318,11 @@ def build_cli() -> argparse.ArgumentParser:
 def main() -> None:
     from worker import worker_command
 
+    logging.basicConfig(
+        level=os.getenv("RELAY_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
     args = build_cli().parse_args()
     if args.slow_seconds < 0 or args.wait_seconds < 0 or args.wait_seconds > 30:
         raise SystemExit("slow-seconds must be >= 0 and wait-seconds must be between 0 and 30")

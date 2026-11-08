@@ -1,0 +1,109 @@
+{{- /* Reuse the existing enrollment secret across upgrades; generate once. */ -}}
+{{- $enroll := .Values.enrollmentSecret -}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace "relay-enrollment" -}}
+{{- if and (not $enroll) $existing -}}
+{{- $enroll = index $existing.data "RELAY_ENROLLMENT_SECRET" | b64dec -}}
+{{- end -}}
+{{- if not $enroll -}}
+{{- $enroll = randAlphaNum 48 -}}
+{{- end -}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: relay-enrollment
+  labels:
+    {{- include "relay.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+data:
+  RELAY_ENROLLMENT_SECRET: {{ $enroll | b64enc | quote }}
+---
+# Kept on `helm uninstall` so the SQLite data survives a reinstall.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-relay-data
+  labels:
+    {{- include "relay.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ .Values.web.storage.storageClass }}
+  resources:
+    requests:
+      storage: {{ .Values.web.storage.size }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-relay-web
+  labels:
+    {{- include "relay.labels" . | nindent 4 }}
+    app: agent-relay-web
+spec:
+  replicas: {{ .Values.web.replicas }}
+  # Recreate, not RollingUpdate: never two pods on the SQLite file at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: agent-relay-web
+  template:
+    metadata:
+      labels:
+        {{- include "relay.labels" . | nindent 8 }}
+        app: agent-relay-web
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: web
+          image: {{ include "relay.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: RELAY_DATABASE_URL
+              value: sqlite:////data/agent-relay.db
+            - name: RELAY_ENROLLMENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: relay-enrollment
+                  key: RELAY_ENROLLMENT_SECRET
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.web.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: agent-relay-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-relay-web
+  labels:
+    {{- include "relay.labels" . | nindent 4 }}
+spec:
+  type: NodePort
+  selector:
+    app: agent-relay-web
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      nodePort: {{ .Values.web.nodePort }}

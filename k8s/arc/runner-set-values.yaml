@@ -1,0 +1,21 @@
+# ARC runner scale set (gha-runner-scale-set).
+# githubConfigUrl and the token secret are passed by `make arc-runners`.
+# Capped at a single runner pod; it exists only while a job is running.
+minRunners: 0
+maxRunners: 1
+
+template:
+  spec:
+    containers:
+      - name: runner
+        image: ghcr.io/actions/actions-runner:latest
+        command: ["/home/runner/run.sh"]
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+
+# Point at the controller installed by `make arc` (release "arc" in arc-systems)
+controllerServiceAccount:
+  namespace: arc-systems
+  name: arc-gha-rs-controller

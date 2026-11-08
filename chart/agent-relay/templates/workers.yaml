@@ -1,0 +1,215 @@
+# The role list, published for scripts (bootstrap / smoke test) so values.yaml
+# stays the single source of truth.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: relay-roles
+  labels:
+    {{- include "relay.labels" . | nindent 4 }}
+{{- $uppercase := list }}
+{{- range $role, $override := .Values.workers.roles }}
+{{- $cfg := mergeOverwrite (deepCopy $.Values.workers.defaults) ($override | default dict) }}
+{{- if eq $cfg.handler "uppercase" }}{{ $uppercase = append $uppercase $role }}{{ end }}
+{{- end }}
+data:
+  roles: {{ keys .Values.workers.roles | sortAlpha | join " " | quote }}
+  # Roles that echo uppercased input; the smoke test only targets these.
+  uppercase_roles: {{ $uppercase | sortAlpha | join " " | quote }}
+{{- range $role, $override := .Values.workers.roles }}
+{{- $cfg := mergeOverwrite (deepCopy $.Values.workers.defaults) ($override | default dict) }}
+{{- /* Skip roles that are not registered yet; `make deploy` registers them
+       and runs helm again. lookup is empty under `helm template`. */}}
+{{- if or (not $.Values.workers.waitForSecret) (lookup "v1" "Secret" $.Release.Namespace (printf "worker-%s" $role)) }}
+---
+# All replicas of a role share one agent identity (Secret worker-{{ $role }}).
+# If one dies mid-task, the lease expires and another replica re-claims it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-{{ $role }}
+  labels:
+    {{- include "relay.labels" $ | nindent 4 }}
+    app: agent-relay-worker
+    role: {{ $role }}
+spec:
+  replicas: {{ $cfg.replicas }}
+  selector:
+    matchLabels:
+      app: agent-relay-worker
+      role: {{ $role }}
+  template:
+    metadata:
+      labels:
+        {{- include "relay.labels" $ | nindent 8 }}
+        app: agent-relay-worker
+        role: {{ $role }}
+      {{- if $cfg.mountProjects }}
+      annotations:
+        # Restart on registry changes so workers never run a stale copy.
+        checksum/projects: {{ toYaml $.Values.projects | sha256sum }}
+      {{- end }}
+    spec:
+      # Workers never call the Kubernetes API; don't hand the agent a token for it.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        # Group-owns mounted project Secrets so the non-root worker can read them.
+        fsGroup: 10001
+      terminationGracePeriodSeconds: 5
+      # Spread replicas of the same role across the kind worker nodes.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: agent-relay-worker
+              role: {{ $role }}
+      containers:
+        # Trusted: relay token, project registry and credentials. Runs no agent code.
+        - name: worker
+          image: {{ include "relay.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          securityContext: &hardened
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          command: ["python", "main.py", "worker"]
+          args:
+            - --base-url=http://agent-relay-web:8000
+            - --agent-id=$(AGENT_ID)
+            - --token=$(TOKEN)
+            - --worker-id=$(POD_NAME)
+            - --handler={{ $cfg.handler }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RELAY_WORKER_SLOW_SECONDS
+              value: {{ $cfg.slowSeconds | quote }}
+            {{- if $cfg.mountProjects }}
+            - name: RELAY_PROJECTS_FILE
+              value: /etc/relay/projects.yaml
+            {{- end }}
+            {{- if $cfg.sandbox }}
+            - name: RELAY_AGENT_RUNNER_SOCKET
+              value: /run/sandbox/runner.sock
+            {{- end }}
+            {{- if eq $cfg.handler "orchestrator" }}
+            {{- /* Other roles' agent IDs (not tokens) so it can address them. */}}
+            {{- range $other, $_ := $.Values.workers.roles }}
+            {{- if and (ne $other $role) (or (not $.Values.workers.waitForSecret) (lookup "v1" "Secret" $.Release.Namespace (printf "worker-%s" $other))) }}
+            - name: RELAY_ROLE_AGENT_{{ $other | upper | replace "-" "_" }}
+              valueFrom:
+                secretKeyRef:
+                  name: worker-{{ $other }}
+                  key: AGENT_ID
+            {{- end }}
+            {{- end }}
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: worker-{{ $role }}
+            {{- if $cfg.useLLM }}
+            # ANTHROPIC_API_KEY; optional so the pod starts without it (the
+            # orchestrator then accepts JSON only).
+            - secretRef:
+                name: {{ $.Values.llm.secretName }}
+                optional: true
+            {{- end }}
+          {{- if or $cfg.mountProjects $cfg.mountProjectSecrets $cfg.sandbox }}
+          volumeMounts:
+            {{- if $cfg.mountProjects }}
+            - name: projects
+              mountPath: /etc/relay
+              readOnly: true
+            {{- end }}
+            {{- if $cfg.mountProjectSecrets }}
+            {{- range $key, $p := $.Values.projects }}
+            - name: cred-{{ $key }}
+              mountPath: /var/run/secrets/projects/{{ trimPrefix "secret/" $p.credentials }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
+            {{- if $cfg.sandbox }}
+            - name: sandbox-socket
+              mountPath: /run/sandbox
+            {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml $cfg.resources | nindent 12 }}
+        {{- if $cfg.sandbox }}
+        # Untrusted: runs the Claude agent. No Secrets, no service-account
+        # token, separate process namespace; reaches the worker only through
+        # the socket and the model only through the proxy (sandbox.py).
+        - name: agent
+          image: {{ include "relay.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          securityContext: *hardened
+          command: ["python", "agent_runner.py"]
+          env:
+            - name: RELAY_AGENT_RUNNER_SOCKET
+              value: /run/sandbox/runner.sock
+            - name: AGENT_WORK_ROOT
+              value: /work
+            - name: HOME
+              value: /work/home
+            - name: ANTHROPIC_BASE_URL
+              value: http://127.0.0.1:{{ $.Values.sandbox.proxyPort }}
+            - name: ANTHROPIC_API_KEY
+              value: added-by-model-proxy
+            - name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+              value: "1"
+            {{- range $name, $value := $.Values.sandbox.agentEnv }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: sandbox-socket
+              mountPath: /run/sandbox
+            - name: agent-work
+              mountPath: /work
+          resources:
+            {{- toYaml $.Values.sandbox.agentResources | nindent 12 }}
+        # Holds only the model API key; listens on the pod's loopback.
+        - name: model-proxy
+          image: {{ include "relay.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          securityContext: *hardened
+          command: ["uvicorn", "model_proxy:app", "--host", "127.0.0.1",
+                    "--port", {{ $.Values.sandbox.proxyPort | quote }}]
+          envFrom:
+            - secretRef:
+                name: {{ $.Values.llm.secretName }}
+                optional: true
+          resources:
+            {{- toYaml $.Values.sandbox.proxyResources | nindent 12 }}
+        {{- end }}
+      {{- if or $cfg.mountProjects $cfg.mountProjectSecrets $cfg.sandbox }}
+      volumes:
+        {{- if $cfg.mountProjects }}
+        - name: projects
+          configMap:
+            name: relay-projects
+        {{- end }}
+        {{- if $cfg.mountProjectSecrets }}
+        {{- range $key, $p := $.Values.projects }}
+        # optional: the pod still starts if the Secret is missing; tasks for
+        # that project then fail with credentials_unavailable.
+        - name: cred-{{ $key }}
+          secret:
+            secretName: {{ trimPrefix "secret/" $p.credentials }}
+            optional: true
+            defaultMode: 0440
+        {{- end }}
+        {{- end }}
+        {{- if $cfg.sandbox }}
+        - name: sandbox-socket
+          emptyDir: { medium: Memory, sizeLimit: 1Mi }
+        - name: agent-work
+          emptyDir: { sizeLimit: {{ $.Values.sandbox.workSize }} }
+        {{- end }}
+      {{- end }}
+{{- end }}
+{{- end }}

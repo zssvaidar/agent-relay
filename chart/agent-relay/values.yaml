@@ -1,0 +1,102 @@
+image:
+  repository: agent-relay
+  tag: dev
+  # The image is loaded into kind with `kind load`, never pulled.
+  pullPolicy: IfNotPresent
+
+# Enrollment secret required to register agents. Empty = generate a random
+# one on first install and keep reusing it on upgrades.
+enrollmentSecret: ""
+
+web:
+  # Must stay 1: SQLite on a ReadWriteOnce volume cannot be shared by pods.
+  replicas: 1
+  nodePort: 30080          # kind maps this to http://localhost:8000
+  storage:
+    size: 1Gi
+    storageClass: standard # kind's local-path provisioner
+  resources:
+    requests: { cpu: 50m, memory: 96Mi }
+    limits: { memory: 256Mi }
+
+workers:
+  # Only render a role's Deployment once its Secret exists. `make template`
+  # sets this to false so you can preview every worker.
+  waitForSecret: true
+
+  # Settings every role gets unless the role overrides them below.
+  defaults:
+    replicas: 1
+    slowSeconds: 0         # RELAY_WORKER_SLOW_SECONDS, for redelivery demos
+    handler: uppercase     # uppercase | orchestrator | deployer | dev-team | reviewer
+    mountProjects: false   # mount ConfigMap relay-projects + set RELAY_PROJECTS_FILE
+    mountProjectSecrets: false # mount every project's credentials Secret (read-only)
+    useLLM: false          # load ANTHROPIC_API_KEY into the worker (orchestrator routing)
+    sandbox: false         # add the agent sandbox + model proxy containers (see below)
+    resources:
+      requests: { cpu: 20m, memory: 64Mi }
+      limits: { memory: 128Mi }
+
+  # One agent identity + Deployment (worker-<role>) per entry.
+  # A role's Deployment is created only once its Secret worker-<role> exists;
+  # `make deploy` registers missing roles and creates those Secrets.
+  roles:
+    # Claude agents. The worker container holds the project credential and
+    # does all git/GitHub work; the agent runs in the credential-free sandbox.
+    dev-team:
+      handler: dev-team
+      mountProjects: true
+      mountProjectSecrets: true
+      sandbox: true
+      resources: &gitResources
+        requests: { cpu: 50m, memory: 128Mi }
+        limits: { memory: 512Mi }
+    reviewer:
+      replicas: 1
+      handler: reviewer
+      mountProjects: true
+      mountProjectSecrets: true
+      sandbox: true
+      resources: *gitResources
+    deployer:
+      handler: deployer
+      mountProjects: true
+      mountProjectSecrets: true
+    # Reads the registry and dispatches work; it needs no project credentials.
+    orchestrator:
+      handler: orchestrator
+      mountProjects: true
+      useLLM: true           # free-text requests; JSON-only without the key
+
+# Secret holding ANTHROPIC_API_KEY (make llm-secret), for roles with useLLM
+# and for the model proxy of sandbox roles.
+llm:
+  secretName: relay-anthropic
+
+# Containers added to roles with `sandbox: true`.
+sandbox:
+  proxyPort: 8787
+  workSize: 4Gi            # agent's clone + build artifacts (emptyDir)
+  agentEnv:
+    AGENT_MAX_TURNS: 60
+    AGENT_MAX_BUDGET_USD: 5
+    AGENT_TIMEOUT_S: 1800
+    # AGENT_MODEL: claude-opus-5-5   # unset = SDK default
+  agentResources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { memory: 2Gi }
+  proxyResources:
+    requests: { cpu: 10m, memory: 64Mi }
+    limits: { memory: 128Mi }
+
+# Project registry owned by the orchestrator (rendered to ConfigMap
+# relay-projects; validated by projects.py / `make check-projects`).
+# `credentials` is a *reference* to a Secret holding a `token` key, created
+# out of band with `make project-secret`; never put the value here.
+projects:
+  cp-expiry-tracker:
+    repo: git@github.com:zssvaidar/cp-expiry-tracker.git
+    default_branch: main
+    registry: ghcr.io/zssvaidar/cp-expiry-tracker
+    deploy_target: k8s/cp-expiry-tracker
+    credentials: secret/cp-expiry-tracker-bot

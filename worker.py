@@ -1,6 +1,7 @@
-"""Deterministic local worker for Agent Relay.
+"""Local worker for Agent Relay.
 
-The worker deliberately performs only ``input.upper()``.  Submitted text is
+The default handler performs only ``input.upper()``; ``--handler`` selects
+another one from :mod:`handlers` (orchestrator, deployer).  Submitted text is
 never evaluated as Python or executed by the relay process.
 """
 
@@ -19,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
+
+from handlers import HANDLERS, Handler, TransientError, build_handler, uppercase
 
 
 LOGGER = logging.getLogger("agent_relay.worker")
@@ -60,8 +63,9 @@ async def run_worker(
     slow_seconds: float = 0,
     wait_seconds: int = 30,
     stop_after: int | None = None,
+    handler: Handler = uppercase,
 ) -> None:
-    """Poll, uppercase, and acknowledge tasks for one agent identity."""
+    """Poll, handle, and acknowledge tasks for one agent identity."""
 
     base_url = base_url.rstrip("/")
     headers = {"Authorization": f"Bearer {token}"}
@@ -111,17 +115,23 @@ async def run_worker(
             try:
                 if slow_seconds > 0:
                     await asyncio.sleep(slow_seconds)
-                # This is the complete execution engine for the starter.  Keep
-                # it explicit so task input remains untrusted data.
-                output = claim["input"].upper()
+                try:
+                    action, value = await handler(claim, client)
+                except TransientError as exc:
+                    # Leave the claim unacknowledged: the lease expires and
+                    # the task is redelivered (up to the attempt limit).
+                    LOGGER.warning("worker=%s task=%s transient error, leaving for redelivery: %s", worker_id, task_id, exc)
+                    continue
+                field = "output" if action == "complete" else "error"
                 result = await submit_terminal(
                     client,
-                    f"/api/v1/tasks/{task_id}/complete",
-                    {"claim_token": claim_token, "output": output},
+                    f"/api/v1/tasks/{task_id}/{action}",
+                    {"claim_token": claim_token, field: value},
                 )
                 if result.status_code == 200:
                     completed += 1
-                    LOGGER.info("worker=%s task=%s attempt=%s status=completed", worker_id, task_id, claim["attempt"])
+                    status = "completed" if action == "complete" else "failed"
+                    LOGGER.info("worker=%s task=%s attempt=%s status=%s", worker_id, task_id, claim["attempt"], status)
                 elif result.status_code == 409:
                     LOGGER.warning("worker=%s task=%s claim became stale", worker_id, task_id)
                 else:
@@ -150,6 +160,9 @@ def save_credentials(path: Path, credentials: dict[str, str]) -> None:
 
 
 async def worker_command(args: argparse.Namespace) -> None:
+    # Load the handler (and its registry) first so a bad registry stops the
+    # process before it registers or claims anything.
+    handler = build_handler(args.handler)
     credentials = load_credentials(args.credentials) if args.credentials else None
     if args.token:
         if not args.agent_id:
@@ -177,13 +190,14 @@ async def worker_command(args: argparse.Namespace) -> None:
         slow_seconds=args.slow_seconds,
         wait_seconds=args.wait_seconds,
         stop_after=args.stop_after,
+        handler=handler,
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Agent Relay deterministic uppercase worker")
+    parser = argparse.ArgumentParser(description="Agent Relay worker")
     subparsers = parser.add_subparsers(dest="command")
-    worker = subparsers.add_parser("worker", help="run the deterministic uppercase worker")
+    worker = subparsers.add_parser("worker", help="run a worker (uppercase by default)")
     worker.add_argument("--base-url", default=os.getenv("RELAY_BASE_URL", "http://127.0.0.1:8000"))
     worker.add_argument("--worker-id", default=f"worker-{uuid.uuid4().hex[:8]}")
     worker.add_argument("--agent-id", default=None, help="existing agent identity used with --token")
@@ -194,11 +208,19 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--enrollment-secret", default=os.getenv("RELAY_ENROLLMENT_SECRET"))
     worker.add_argument("--slow-seconds", type=float, default=float(os.getenv("RELAY_WORKER_SLOW_SECONDS", "0")))
     worker.add_argument("--wait-seconds", type=int, default=30)
+    worker.add_argument(
+        "--handler", choices=HANDLERS, default=os.getenv("RELAY_WORKER_HANDLER", "uppercase"),
+        help="what to do with each task (orchestrator/deployer read RELAY_PROJECTS_FILE)",
+    )
     worker.add_argument("--stop-after", type=int, default=None, help="exit after completing this many tasks")
     return parser
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=os.getenv("RELAY_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     argv = sys.argv[1:]
     # ``main.py worker ...`` is the documented form, while accepting
     # ``worker.py ...`` is convenient when the worker module is copied into a
