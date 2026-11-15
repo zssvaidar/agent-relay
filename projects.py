@@ -4,7 +4,9 @@ The registry is a YAML file (rendered by the Helm chart from ``values.yaml``
 into ConfigMap ``relay-projects``) that lists every project the agents may
 work on.  It holds only *references* to credentials, never their values:
 ``credentials: secret/<name>`` names a Kubernetes Secret that is mounted, read
-only, into the workers that actually need it (the deployer).
+only, into the workers that actually need it (the deployer).  The optional
+``aws_project: <name>`` names the myinfra project whose role the deployer gets
+short-lived AWS keys for (see aws_vendor.py).
 
 Task input must only ever carry a project key; workers resolve the rest here.
 """
@@ -49,6 +51,8 @@ class ProjectConfig(BaseModel):
     registry: str = Field(min_length=1)
     deploy_target: DeployTarget
     credentials: str
+    # myinfra project (role proj-<name>); None = the project needs no AWS access.
+    aws_project: str | None = None
 
     @field_validator("repo")
     @classmethod
@@ -73,6 +77,13 @@ class ProjectConfig(BaseModel):
         prefix, sep, name = value.partition("/")
         if prefix != "secret" or not sep or not SECRET_NAME.match(name):
             raise ValueError("must be a reference of the form secret/<k8s-secret-name>, never a raw value")
+        return value
+
+    @field_validator("aws_project")
+    @classmethod
+    def validate_aws_project(cls, value: str | None) -> str | None:
+        if value is not None and not PROJECT_KEY.match(value):
+            raise ValueError("must be a myinfra project name (lowercase slug)")
         return value
 
     @property

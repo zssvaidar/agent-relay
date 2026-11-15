@@ -96,6 +96,10 @@ spec:
             - name: RELAY_AGENT_RUNNER_SOCKET
               value: /run/sandbox/runner.sock
             {{- end }}
+            {{- if and $cfg.useAWS $.Values.aws.vendorUrl }}
+            - name: RELAY_STS_VENDOR_URL
+              value: {{ $.Values.aws.vendorUrl | quote }}
+            {{- end }}
             {{- if eq $cfg.handler "orchestrator" }}
             {{- /* Other roles' agent IDs (not tokens) so it can address them. */}}
             {{- range $other, $_ := $.Values.workers.roles }}
@@ -117,6 +121,13 @@ spec:
             # accepts JSON only).
             - secretRef:
                 name: {{ $.Values.llm.secretName }}
+                optional: true
+            {{- end }}
+            {{- if $cfg.useAWS }}
+            # agent-deployer IAM user key; it may only call the STS vendor URL.
+            # optional: without it, AWS projects fail with aws_unavailable.
+            - secretRef:
+                name: {{ $.Values.aws.secretName }}
                 optional: true
             {{- end }}
           {{- if or $cfg.mountProjects $cfg.mountProjectSecrets $cfg.sandbox }}

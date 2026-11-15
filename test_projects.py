@@ -204,3 +204,125 @@ def test_deployer_uses_mounted_secret_and_never_echoes_it(relay, tmp_path):
     assert done["status"] == "completed"
     assert json.loads(done["output"])["image"] == "ghcr.io/zssvaidar/cp-expiry-tracker:v1.0.0"
     assert SECRET_VALUE not in done["output"]
+
+
+# --- AWS credentials from the STS vendor ------------------------------------
+
+from botocore.credentials import Credentials
+
+from aws_vendor import StsVendor
+from common import RejectedError, TransientError
+
+VENDOR_URL = "https://abc123.lambda-url.ap-northeast-1.on.aws/"
+AWS_SECRET = "temporary-secret-should-never-leak"
+AWS_TOKEN = "temporary-session-token-should-never-leak"
+SIGNER = Credentials("AKIAAGENTDEPLOYER", "agent-deployer-secret")
+
+
+def fake_vendor(status: int = 200, body: dict | None = None, seen: list | None = None) -> StsVendor:
+    reply = body if body is not None else {
+        "AccessKeyId": "ASIATEMPORARY",
+        "SecretAccessKey": AWS_SECRET,
+        "SessionToken": AWS_TOKEN,
+        "Expiration": "2026-11-15 12:15:00+00:00",
+    }
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if seen is not None:
+            seen.append(request)
+        return httpx.Response(status, json=reply)
+
+    return StsVendor(VENDOR_URL, signer=SIGNER, transport=httpx.MockTransport(handle))
+
+
+def write_bot_token(tmp_path) -> str:
+    (tmp_path / "cp-expiry-tracker-bot").mkdir()
+    (tmp_path / "cp-expiry-tracker-bot" / "token").write_text(SECRET_VALUE)
+    return str(tmp_path)
+
+
+def test_registry_aws_project_is_optional_and_validated():
+    assert parse_registry(registry())["cp-expiry-tracker"].aws_project is None
+    assert parse_registry(registry(aws_project="cp-expiry-tracker"))["cp-expiry-tracker"].aws_project == "cp-expiry-tracker"
+    with pytest.raises(RegistryError):
+        parse_registry(registry(aws_project="../admin"))
+
+
+def test_deployer_gets_aws_credentials_from_vendor_and_never_echoes_them(relay, tmp_path):
+    sender, deployer = register(relay, "orchestrator"), register(relay, "deployer")
+    projects = parse_registry(registry(aws_project="cp-expiry-tracker"))
+    seen: list[httpx.Request] = []
+    handler = make_deployer(projects, write_bot_token(tmp_path), aws=fake_vendor(seen=seen))
+    # aws_project in task input is ignored: only the registry decides.
+    request = json.dumps({"project": "cp-expiry-tracker", "aws_project": "admin", "ref": "v1"})
+
+    done = run_one(relay, sender, deployer, handler, request)
+
+    assert done["status"] == "completed", done
+    output = json.loads(done["output"])
+    assert output["aws"] == {"project": "cp-expiry-tracker", "expires": "2026-11-15 12:15:00+00:00"}
+    for secret in (AWS_SECRET, AWS_TOKEN, "ASIATEMPORARY", SECRET_VALUE):
+        assert secret not in done["output"]
+    [sent] = seen
+    assert json.loads(sent.content) == {"project": "cp-expiry-tracker", "duration": 900}
+    auth = sent.headers["authorization"]
+    assert auth.startswith("AWS4-HMAC-SHA256 Credential=AKIAAGENTDEPLOYER/")
+    assert "/ap-northeast-1/lambda/aws4_request" in auth
+
+
+def test_deployer_skips_vendor_for_projects_without_aws(relay, tmp_path):
+    sender, deployer = register(relay, "orchestrator"), register(relay, "deployer")
+    seen: list[httpx.Request] = []
+    handler = make_deployer(parse_registry(registry()), write_bot_token(tmp_path), aws=fake_vendor(seen=seen))
+    done = run_one(relay, sender, deployer, handler, json.dumps({"project": "cp-expiry-tracker"}))
+    assert done["status"] == "completed"
+    assert "aws" not in json.loads(done["output"])
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    ("vendor", "error_prefix"),
+    [
+        (None, "aws_unavailable"),
+        (fake_vendor(503, {"error": "sts-vendor is switched off"}), "aws_vendor_off"),
+        (fake_vendor(403, {"error": "agent-deployer may not get credentials"}), "aws_denied"),
+        (fake_vendor(403, {"Message": "Forbidden"}), "aws_denied"),
+        (fake_vendor(200, {"error": "weird"}), "aws_denied"),
+    ],
+)
+def test_deployer_fails_when_vendor_refuses(relay, tmp_path, vendor, error_prefix):
+    sender, deployer = register(relay, "orchestrator"), register(relay, "deployer")
+    projects = parse_registry(registry(aws_project="cp-expiry-tracker"))
+    handler = make_deployer(projects, write_bot_token(tmp_path), aws=vendor)
+    task = run_one(relay, sender, deployer, handler, json.dumps({"project": "cp-expiry-tracker"}))
+    assert task["status"] == "failed"
+    assert task["error"].startswith(error_prefix), task["error"]
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 504])
+def test_vendor_throttling_is_transient(status):
+    with pytest.raises(TransientError):
+        asyncio.run(fake_vendor(status, {"Message": "Too Many Requests"})("cp-expiry-tracker"))
+
+
+def test_vendor_network_error_is_transient():
+    def broken(_request):
+        raise httpx.ConnectError("no route")
+
+    vendor = StsVendor(VENDOR_URL, signer=SIGNER, transport=httpx.MockTransport(broken))
+    with pytest.raises(TransientError):
+        asyncio.run(vendor("cp-expiry-tracker"))
+
+
+def test_vendor_without_signing_identity_is_rejected(monkeypatch):
+    import aws_vendor
+
+    monkeypatch.setattr(aws_vendor, "get_session", lambda: type("S", (), {"get_credentials": lambda self: None})())
+    with pytest.raises(RejectedError, match="aws_unavailable"):
+        asyncio.run(StsVendor(VENDOR_URL)("cp-expiry-tracker"))
+
+
+def test_credentials_repr_hides_secrets():
+    creds = asyncio.run(fake_vendor()("cp-expiry-tracker"))
+    assert AWS_SECRET not in repr(creds) and AWS_TOKEN not in repr(creds)
+    assert creds.env()["AWS_SESSION_TOKEN"] == AWS_TOKEN

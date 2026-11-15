@@ -21,6 +21,7 @@ import httpx
 import claude_cli
 
 from agent_roles import make_dev_team, make_reviewer
+from aws_vendor import VENDOR_URL_ENV, AwsCredentials, CredentialSource, vendor_from_env
 from common import (
     HTTP_CREATED,
     TRANSIENT,
@@ -164,8 +165,29 @@ def make_orchestrator(
 # ---------------------------------------------------------------- deployer
 
 
-def make_deployer(projects: dict[str, ProjectConfig], secrets_dir: str | None = None) -> Handler:
-    """Build the handler that deploys a project's ref to its registered target."""
+async def project_aws_credentials(
+    project: ProjectConfig, aws: CredentialSource | None
+) -> AwsCredentials | None:
+    """Short-lived keys for the project's AWS role, or None if it has none."""
+    if project.aws_project is None:
+        return None
+    if aws is None:
+        raise RejectedError(
+            f"aws_unavailable: project needs AWS access but {VENDOR_URL_ENV} is not set"
+        )
+    return await aws(project.aws_project)
+
+
+def make_deployer(
+    projects: dict[str, ProjectConfig],
+    secrets_dir: str | None = None,
+    aws: CredentialSource | None = None,
+) -> Handler:
+    """Build the handler that deploys a project's ref to its registered target.
+
+    ``aws`` fetches short-lived keys (from the STS vendor) for projects with
+    ``aws_project`` set in the registry.
+    """
 
     @rejecting
     async def deploy(claim: dict[str, Any], _client: httpx.AsyncClient) -> Outcome:
@@ -176,18 +198,20 @@ def make_deployer(projects: dict[str, ProjectConfig], secrets_dir: str | None = 
         project = lookup_project(projects, key)
         ref = require_ref(request, project)
         require_credential(project, secrets_dir)
+        credentials = await project_aws_credentials(project, aws)
         target = f"{project.deploy_target.kind}/{project.deploy_target.name}"
         # Placeholder for the real deploy (helm upgrade / vercel deploy) that
-        # would use the mounted credential. Never echo the credential.
-        return "complete", json.dumps(
-            {
-                "project": key,
-                "deploy_target": target,
-                "image": f"{project.registry}:{ref}",
-                "status": "simulated",
-            },
-            sort_keys=True,
-        )
+        # would use the mounted credential and, for AWS, run with
+        # env={**os.environ, **credentials.env()}. Never echo either.
+        output: dict[str, Any] = {
+            "project": key,
+            "deploy_target": target,
+            "image": f"{project.registry}:{ref}",
+            "status": "simulated",
+        }
+        if credentials is not None:
+            output["aws"] = {"project": project.aws_project, "expires": credentials.expiration}
+        return "complete", json.dumps(output, sort_keys=True)
 
     return deploy
 
@@ -212,7 +236,7 @@ def build_handler(name: str) -> Handler:
         role_agents = {role: os.getenv(role_env_var(role), "") for role in ACTION_ROLES.values()}
         return make_orchestrator(projects, role_agents, router_llm())
     if name == "deployer":
-        return make_deployer(projects)
+        return make_deployer(projects, aws=vendor_from_env())
     if name == "dev-team":
         return make_dev_team(projects)
     if name == "reviewer":
