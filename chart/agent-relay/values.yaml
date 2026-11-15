@@ -32,6 +32,7 @@ workers:
     mountProjects: false   # mount ConfigMap relay-projects + set RELAY_PROJECTS_FILE
     mountProjectSecrets: false # mount every project's credentials Secret (read-only)
     useLLM: false          # load the Claude credential into the worker (orchestrator routing)
+    useAWS: false          # sign STS-vendor requests as aws.secretName's IAM user (see aws below)
     sandbox: false         # add the agent sandbox + model proxy containers (see below)
     resources:
       requests: { cpu: 20m, memory: 64Mi }
@@ -62,6 +63,7 @@ workers:
       handler: deployer
       mountProjects: true
       mountProjectSecrets: true
+      useAWS: true           # short-lived keys for projects with aws_project
     # Reads the registry and dispatches work; it needs no project credentials.
     orchestrator:
       handler: orchestrator
@@ -76,6 +78,15 @@ workers:
 # subscription token from `claude setup-token`) or ANTHROPIC_API_KEY.
 llm:
   secretName: relay-anthropic
+
+# Short-lived AWS keys for projects with `aws_project`, from the STS vendor
+# Lambda in myinfra (platform/sts-vendor). Roles with useAWS get:
+#   RELAY_STS_VENDOR_URL = vendorUrl  (myinfra: make output S=platform/sts-vendor)
+#   Secret secretName = AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY of the
+#   agent-deployer IAM user (make aws-secret); it can only call the vendor URL.
+aws:
+  vendorUrl: ""
+  secretName: relay-aws-deployer
 
 # Containers added to roles with `sandbox: true`.
 sandbox:
@@ -97,6 +108,8 @@ sandbox:
 # relay-projects; validated by projects.py / `make check-projects`).
 # `credentials` is a *reference* to a Secret holding a `token` key, created
 # out of band with `make project-secret`; never put the value here.
+# Optional `aws_project` names the myinfra project whose role the deployer
+# gets temporary AWS keys for (see `aws` above).
 projects:
   cp-expiry-tracker:
     repo: git@github.com:zssvaidar/cp-expiry-tracker.git
@@ -104,3 +117,5 @@ projects:
     registry: ghcr.io/zssvaidar/cp-expiry-tracker
     deploy_target: k8s/cp-expiry-tracker
     credentials: secret/cp-expiry-tracker-bot
+    # myinfra project: the deployer gets role proj-cp-expiry-tracker's keys.
+    aws_project: cp-expiry-tracker

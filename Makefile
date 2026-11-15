@@ -6,13 +6,16 @@ BASE_URL  ?= http://localhost:8000
 CHART     := chart/agent-relay
 # Extra helm flags, e.g. HELM_ARGS="--set workers.roles.reviewer.replicas=3"
 HELM_ARGS ?=
+# myinfra STS vendor URL (make output S=platform/sts-vendor); sets aws.vendorUrl.
+STS_VENDOR_URL ?=
 
 KUBECTL   := kubectl --context kind-$(CLUSTER) -n $(NS)
 HELM      := helm --kube-context kind-$(CLUSTER) -n $(NS)
 # Secrets can be stored before the first deploy; helm accepts an existing namespace.
 ENSURE_NS := kubectl --context kind-$(CLUSTER) create namespace $(NS) --dry-run=client -o yaml | \
              kubectl --context kind-$(CLUSTER) apply -f - >/dev/null
-HELM_UP   := $(HELM) upgrade --install $(RELEASE) $(CHART) --create-namespace --wait --timeout 3m $(HELM_ARGS)
+HELM_UP   := $(HELM) upgrade --install $(RELEASE) $(CHART) --create-namespace --wait --timeout 3m \
+             $(if $(STS_VENDOR_URL),--set aws.vendorUrl=$(STS_VENDOR_URL)) $(HELM_ARGS)
 
 # Optional filter for logs-workers, e.g. ROLE=reviewer
 comma := ,
@@ -33,7 +36,7 @@ export NS BASE_URL
 .DEFAULT_GOAL := help
 .PHONY: help up cluster image deploy bootstrap template lint smoke status \
         logs logs-web logs-workers restart redeploy scale-workers uninstall \
-        check-projects project-secret llm-secret smoke-project github-intake \
+        check-projects project-secret llm-secret aws-secret smoke-project github-intake \
         test down clean arc arc-runners arc-status arc-uninstall
 
 help: ## Show available targets
@@ -103,6 +106,16 @@ llm-secret: ## Store the Claude credential: make llm-secret FROM=<file> [KEY=CLA
 	@tr -d '[:space:]' < "$(FROM)" | \
 	  $(KUBECTL) create secret generic relay-anthropic --from-file=$(or $(KEY),CLAUDE_CODE_OAUTH_TOKEN)=/dev/stdin \
 	  --dry-run=client -o yaml | $(KUBECTL) apply -f - && echo "stored secret/relay-anthropic"
+
+aws-secret: ## Store the agent-deployer AWS key from a CLI profile: make aws-secret [AWS_PROFILE=agent-deployer]
+	@profile=$(or $(AWS_PROFILE),agent-deployer); \
+	id=$$(aws configure get aws_access_key_id --profile $$profile); \
+	key=$$(aws configure get aws_secret_access_key --profile $$profile); \
+	test -n "$$id" -a -n "$$key" || { echo "no access key in AWS profile $$profile (see myinfra README, step 4)"; exit 1; }; \
+	$(ENSURE_NS); \
+	printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n' "$$id" "$$key" | \
+	  $(KUBECTL) create secret generic relay-aws-deployer --from-env-file=/dev/stdin \
+	  --dry-run=client -o yaml | $(KUBECTL) apply -f - && echo "stored secret/relay-aws-deployer"
 
 status: ## Show helm release, pods (with nodes), services and PVC
 	$(HELM) list

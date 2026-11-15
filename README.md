@@ -79,6 +79,7 @@ projects:
     registry: ghcr.io/zssvaidar/cp-expiry-tracker
     deploy_target: k8s/cp-expiry-tracker     # <k8s|vercel>/<name>
     credentials: secret/cp-expiry-tracker-bot  # a Secret NAME, never a value
+    aws_project: cp-expiry-tracker           # optional: myinfra project role
 ```
 
 - The **orchestrator** worker (`--handler orchestrator`) reads the registry.
@@ -101,6 +102,38 @@ make smoke-project PROJECT=cp-expiry-tracker REF=main # orchestrator -> deployer
 
 To add a project: add an entry under `projects:`, run `make project-secret`, then
 `make deploy`. The orchestrator and deployer restart on registry changes.
+
+### AWS credentials for the deployer (myinfra STS vendor)
+
+A project with `aws_project: <name>` in the registry gets short-lived AWS keys
+for role `proj-<name>` from the STS vendor Lambda in
+[myinfra](https://github.com/zssvaidar/myinfra) (`platform/sts-vendor`). On
+each deploy task the deployer signs a request (SigV4, service `lambda`) with the
+`agent-deployer` IAM user's key and gets back 15-minute keys. Those keys stay in
+memory for the deploy step; task output only shows the AWS project and the
+expiry time. The AWS project comes from the registry, never from task input,
+and the vendor's allow-list in myinfra (`platform/sts-vendor/access.tf`) decides
+whether `agent-deployer` may get it.
+
+```bash
+# in myinfra: deploy the vendor, turn it on, create agent-deployer's access key
+# in the console and save it as the CLI profile agent-deployer
+make output S=platform/sts-vendor              # -> url
+make vendor-on
+
+# here
+make aws-secret                                # profile agent-deployer -> secret/relay-aws-deployer
+make deploy STS_VENDOR_URL=https://<id>.lambda-url.ap-northeast-1.on.aws/
+make smoke-project PROJECT=cp-expiry-tracker   # output has "aws": {"project", "expires"}
+```
+
+| Error | Meaning |
+|---|---|
+| `aws_unavailable` | `RELAY_STS_VENDOR_URL` is unset or `secret/relay-aws-deployer` is missing |
+| `aws_vendor_off` | The vendor is switched off (`make vendor-on` in myinfra) |
+| `aws_denied` | The vendor refused: `agent-deployer` isn't allowed that project in `access.tf`, the signature is wrong, or the role doesn't exist |
+
+Throttling (429/5xx) and network errors leave the task for redelivery.
 
 ## Agent roles (dev-team, reviewer)
 
